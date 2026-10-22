@@ -50,10 +50,35 @@ DEFAULT_ALERTS = [
     {"ticker": "AAPL", "target": 250.0, "direction": "above"},
     {"ticker": "NVDA", "target": 150.0, "direction": "below"},
 ]
-ALERTS = json.loads(os.getenv("ALERTS_JSON") or "null") or DEFAULT_ALERTS
 CHECK_SECONDS = 300                      # 5 minutes
 STATE_FILE = Path(__file__).with_name("alert_state.json")
 # ---------------------------------------------------------------------------
+
+
+def load_alerts() -> tuple[list, str | None]:
+    """Return (alerts, error). A bad ALERTS_JSON gives an error message instead of a crash."""
+    raw = (os.getenv("ALERTS_JSON") or "").strip()
+    if not raw:
+        return DEFAULT_ALERTS, None
+    try:
+        alerts = json.loads(raw)
+        if isinstance(alerts, dict):
+            alerts = [alerts]
+        if not isinstance(alerts, list):
+            raise ValueError("must be a list in square brackets [...]")
+        for i, a in enumerate(alerts, 1):
+            if not isinstance(a, dict):
+                raise ValueError(f"alert {i} must be in curly braces {{...}}")
+            missing = {"ticker", "target", "direction"} - a.keys()
+            if missing:
+                raise ValueError(f"alert {i} is missing {', '.join(sorted(missing))}")
+            a["target"] = float(a["target"])
+            a["direction"] = str(a["direction"]).lower()
+            if a["direction"] not in ("above", "below"):
+                raise ValueError(f"alert {i} direction must be \"above\" or \"below\"")
+        return alerts, None
+    except Exception as e:
+        return [], f"ALERTS_JSON problem: {e}"
 
 
 def get_price(ticker: str) -> float | None:
@@ -140,9 +165,9 @@ def alert_key(a: dict) -> str:
 
 
 # ----------------------------------------------------------------- MAIN ---
-def check_once() -> None:
+def check_once(alerts: list) -> None:
     state = load_state()
-    for a in ALERTS:
+    for a in alerts:
         key = alert_key(a)
         if state.get(key):          # already fired - don't spam
             continue
@@ -160,16 +185,29 @@ def check_once() -> None:
             save_state(state)
 
 
+def describe(alerts: list) -> str:
+    return "\n".join(f"- {a['ticker']} {a['direction']} {a['target']:g}" for a in alerts)
+
+
 def main() -> None:
+    alerts, error = load_alerts()
+    if error:
+        print(error)
     if "--test" in sys.argv:
-        notify("Test from price_alert.py - notifications are working.")
+        if error:
+            notify(f"Test from price_alert.py - notifications work, BUT:\n{error}")
+        else:
+            notify("Test from price_alert.py - notifications are working.\n"
+                   f"Watching {len(alerts)} alert(s):\n{describe(alerts)}")
         return
+    if error:
+        sys.exit(1)
     if "--once" in sys.argv:
-        check_once()
+        check_once(alerts)
         return
-    print(f"Watching {len(ALERTS)} alert(s) every {CHECK_SECONDS}s. Ctrl+C to stop.")
+    print(f"Watching {len(alerts)} alert(s) every {CHECK_SECONDS}s. Ctrl+C to stop.")
     while True:
-        check_once()
+        check_once(alerts)
         time.sleep(CHECK_SECONDS)
 
 
