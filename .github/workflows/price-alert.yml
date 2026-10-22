@@ -1,0 +1,52 @@
+name: Price Alert
+
+on:
+  schedule:
+    # Every 10 min, Mon-Fri, 13:00-21:59 UTC = covers the US session
+    # (9:30am-4pm New York) in both daylight-saving and standard time.
+    - cron: "*/10 13-21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "once = normal check, test = send a test message"
+        default: once
+        type: choice
+        options: [once, test]
+
+permissions:
+  contents: write          # lets the job commit alert_state.json
+
+concurrency:
+  group: price-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check prices
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALERTS_JSON:        ${{ secrets.ALERTS_JSON }}
+        run: python price_alert.py --${{ github.event.inputs.mode || 'once' }}
+
+      - name: Save fired-alert state
+        run: |
+          if [ -f alert_state.json ] && [ -n "$(git status --porcelain alert_state.json)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add alert_state.json
+            git commit -m "Update alert state"
+            git push
+          fi
