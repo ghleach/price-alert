@@ -39,6 +39,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           ALERTS_JSON:        ${{ secrets.ALERTS_JSON }}
+          ALERT_KEY_SECRET:   ${{ secrets.ALERT_KEY_SECRET }}
         run: python price_alert.py --${{ github.event.inputs.mode || 'once' }}
 
       - name: Save fired-alert state
@@ -48,5 +49,12 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add alert_state.json
             git commit -m "Update alert state"
-            git push
+            # Rebase onto anything pushed since checkout, retrying a few times,
+            # so a rejected push doesn't lose state and re-fire alerts.
+            for i in 1 2 3; do
+              git pull --rebase && git push && exit 0
+              sleep 5
+            done
+            echo "Could not push alert state" >&2
+            exit 1
           fi
