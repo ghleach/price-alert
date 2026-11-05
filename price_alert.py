@@ -5,6 +5,15 @@ SETUP
 -----
 pip install yfinance requests twilio
 
+WHERE ALERTS COME FROM (first one that is set wins)
+  1. Google Sheet (recommended) - see sheet/Code.gs for the Apps Script.
+       SHEET_URL=<web app URL>   SHEET_TOKEN=<token logged by setup()>
+     Fired alerts are recorded in the sheet itself; clear "Fired at" to re-arm.
+  2. ALERTS_JSON - a JSON list, e.g.
+       [{"ticker": "AAPL", "target": 250, "direction": "above"}]
+     Fired alerts are recorded in alert_state.json.
+  3. DEFAULT_ALERTS below.
+
 Set only the environment variables for the channels you want (others are skipped):
 
   Telegram (free, recommended):
@@ -64,8 +73,66 @@ STATE_FILE = Path(__file__).with_name("alert_state.json")
 # ---------------------------------------------------------------------------
 
 
+def validate_alert(a: dict) -> str | None:
+    """Normalise an alert in place; return an error message if it's unusable."""
+    missing = {"ticker", "target", "direction"} - a.keys()
+    if missing:
+        return f"missing {', '.join(sorted(missing))}"
+    a["ticker"] = str(a["ticker"]).strip().upper()
+    if not a["ticker"]:
+        return "ticker is blank"
+    try:
+        a["target"] = float(str(a["target"]).replace(",", "").replace("$", ""))
+    except ValueError:
+        return f"target {a['target']!r} is not a number"
+    a["direction"] = str(a["direction"]).strip().lower()
+    if a["direction"] not in ("above", "below"):
+        return 'direction must be "above" or "below"'
+    return None
+
+
+def sheet_enabled() -> bool:
+    return bool(os.getenv("SHEET_URL") and os.getenv("SHEET_TOKEN"))
+
+
+def load_sheet_alerts() -> tuple[list, str | None]:
+    """Read alerts from the Google Sheet web app. Bad rows are kept with an 'error'."""
+    try:
+        r = requests.get(os.environ["SHEET_URL"],
+                         params={"token": os.environ["SHEET_TOKEN"]}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return [], f"Couldn't read the Google Sheet: {e}"
+    if "error" in data:
+        return [], f"Google Sheet said: {data['error']} (check SHEET_TOKEN)"
+    alerts = data.get("alerts", [])
+    for a in alerts:
+        a["error"] = validate_alert(a)
+    return alerts, None
+
+
+def push_sheet_updates(updates: list) -> None:
+    """Write prices / status / fired time back to the sheet (retries a few times)."""
+    body = {"token": os.environ["SHEET_TOKEN"], "updates": updates}
+    for attempt in range(3):
+        try:
+            r = requests.post(os.environ["SHEET_URL"], json=body, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            if "error" in data:
+                raise RuntimeError(data["error"])
+            return
+        except Exception as e:
+            print(f"Sheet update failed (attempt {attempt + 1}): {e}")
+            time.sleep(5)
+    print("WARNING: couldn't update the sheet; a fired alert may repeat next run")
+
+
 def load_alerts() -> tuple[list, str | None]:
-    """Return (alerts, error). A bad ALERTS_JSON gives an error message instead of a crash."""
+    """Return (alerts, error). A bad source gives an error message instead of a crash."""
+    if sheet_enabled():
+        return load_sheet_alerts()
     raw = (os.getenv("ALERTS_JSON") or "").strip()
     if not raw:
         return DEFAULT_ALERTS, None
@@ -78,13 +145,9 @@ def load_alerts() -> tuple[list, str | None]:
         for i, a in enumerate(alerts, 1):
             if not isinstance(a, dict):
                 raise ValueError(f"alert {i} must be in curly braces {{...}}")
-            missing = {"ticker", "target", "direction"} - a.keys()
-            if missing:
-                raise ValueError(f"alert {i} is missing {', '.join(sorted(missing))}")
-            a["target"] = float(a["target"])
-            a["direction"] = str(a["direction"]).lower()
-            if a["direction"] not in ("above", "below"):
-                raise ValueError(f"alert {i} direction must be \"above\" or \"below\"")
+            problem = validate_alert(a)
+            if problem:
+                raise ValueError(f"alert {i}: {problem}")
         return alerts, None
     except Exception as e:
         return [], f"ALERTS_JSON problem: {e}"
@@ -212,13 +275,27 @@ def alert_key(a: dict) -> str:
 
 # ----------------------------------------------------------------- MAIN ---
 def check_once(alerts: list) -> None:
-    state = load_state()
+    sheet = sheet_enabled()
+    state = {} if sheet else load_state()
+    updates = []                                   # sheet mode: written back at the end
+
+    def report(a, status, last=None, fired=None):
+        if sheet and "row" in a:
+            updates.append({"row": a["row"], "ticker": a["ticker"],
+                            "direction": a.get("direction"), "target": a.get("target"),
+                            "status": status, "last": last, "fired": fired})
+
     for a in alerts:
+        if a.get("error"):
+            print(f"Row {a.get('row')}: {a['error']}")
+            report(a, f"Error: {a['error']}")
+            continue
         key = alert_key(a)
-        if state.get(key):          # already fired - don't spam
+        if a.get("fired") or state.get(key):     # already fired - don't spam
             continue
         quote = get_quote(a["ticker"])
         if quote is None:
+            report(a, "No price - check the ticker (Yahoo format, e.g. CBA.AX)")
             continue
         price, high, low = quote
         if a["direction"] == "above":
@@ -228,20 +305,38 @@ def check_once(alerts: list) -> None:
         stamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         print(f"{stamp} {a['ticker']}: {price:.2f} (day {low:.2f}-{high:.2f}, "
               f"target {a['direction']} {a['target']})")
-        if hit:
-            msg = f"Price alert: {a['ticker']} is {price:.2f}"
-            if extreme != price:
-                word = "high" if a["direction"] == "above" else "low"
-                msg += f" (day {word} {extreme:.2f})"
-            msg += f", {a['direction']} your target of {a['target']}."
-            if notify(msg):
-                state[key] = datetime.now(timezone.utc).isoformat()
+        if not hit:
+            report(a, "Watching", last=price)
+            continue
+        msg = f"Price alert: {a['ticker']} is {price:.2f}"
+        if extreme != price:
+            word = "high" if a["direction"] == "above" else "low"
+            msg += f" (day {word} {extreme:.2f})"
+        msg += f", {a['direction']} your target of {a['target']:g}."
+        if notify(msg):
+            now = datetime.now(timezone.utc).isoformat()
+            if sheet:
+                report(a, "Fired", last=price, fired=now)
+            else:
+                state[key] = now
                 save_state(state)
-            # else: leave it armed so the next run tries again
+        else:
+            # leave it armed so the next run tries again
+            report(a, "Hit, but notification failed - retrying", last=price)
+
+    if sheet and updates:
+        push_sheet_updates(updates)
 
 
 def describe(alerts: list) -> str:
-    return "\n".join(f"- {a['ticker']} {a['direction']} {a['target']:g}" for a in alerts)
+    lines = []
+    for a in alerts:
+        if a.get("error"):
+            lines.append(f"- row {a.get('row')}: {a['error']}")
+        else:
+            done = " (fired)" if a.get("fired") else ""
+            lines.append(f"- {a['ticker']} {a['direction']} {a['target']:g}{done}")
+    return "\n".join(lines) or "- (none)"
 
 
 def main() -> None:
