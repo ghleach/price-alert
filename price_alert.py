@@ -20,6 +20,11 @@ Set only the environment variables for the channels you want (others are skipped
     LINE_CHANNEL_TOKEN=...   LINE_USER_ID=...
     (Free plan includes a monthly quota of push messages.)
 
+  State-file privacy (recommended if the repo is public):
+    ALERT_KEY_SECRET=...  any long random string. Fired alerts are stored as an
+    HMAC keyed with this, so the committed alert_state.json can't be reversed
+    to recover your tickers/targets. Changing it re-arms every alert.
+
   SMS / phone call (Twilio, paid per message/call):
     TWILIO_SID=...  TWILIO_TOKEN=...  TWILIO_FROM=+1...  TWILIO_TO=+66...
     TWILIO_CALL=1      # optional: also phone you, not just SMS
@@ -29,14 +34,18 @@ RUN
   python price_alert.py            # loop forever, checking every CHECK_SECONDS
   python price_alert.py --once     # single check (use with cron / GitHub Actions)
   python price_alert.py --test     # send a test notification and exit
+
+Each alert fires once. To re-arm it, change its target (or delete its line in
+alert_state.json).
 """
 
 import hashlib
+import hmac
 import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -81,34 +90,58 @@ def load_alerts() -> tuple[list, str | None]:
         return [], f"ALERTS_JSON problem: {e}"
 
 
-def get_price(ticker: str) -> float | None:
-    """Latest price from Yahoo Finance (may be delayed ~15 min for some exchanges)."""
+def _num(info, *keys) -> float | None:
+    for k in keys:
+        try:
+            v = info.get(k)
+        except Exception:
+            v = None
+        if v is not None:
+            v = float(v)
+            if v == v and v > 0:            # skip NaN / zero
+                return v
+    return None
+
+
+def get_quote(ticker: str) -> tuple[float, float, float] | None:
+    """(last, day_high, day_low) from Yahoo Finance (may be delayed ~15 min).
+
+    The day's high/low lets us catch a target that was crossed between checks,
+    even if the price has since moved back.
+    """
     try:
         info = yf.Ticker(ticker).fast_info
-        price = info.get("last_price") or info.get("lastPrice")
-        return float(price) if price else None
+        last = _num(info, "lastPrice", "last_price")
+        if last is None:
+            return None
+        high = _num(info, "dayHigh", "day_high") or last
+        low = _num(info, "dayLow", "day_low") or last
+        return last, max(high, last), min(low, last)
     except Exception as e:
         print(f"[{ticker}] price fetch failed: {e}")
         return None
 
 
 # ------------------------------------------------------------- NOTIFIERS ---
-def send_telegram(msg: str) -> None:
+# Each notifier returns True if it sent, False if its channel isn't configured,
+# and raises if sending failed.
+def send_telegram(msg: str) -> bool:
     token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not (token and chat):
-        return
+        return False
     r = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json={"chat_id": chat, "text": msg},
         timeout=10,
     )
     r.raise_for_status()
+    return True
 
 
-def send_line(msg: str) -> None:
+def send_line(msg: str) -> bool:
     token, user = os.getenv("LINE_CHANNEL_TOKEN"), os.getenv("LINE_USER_ID")
     if not (token and user):
-        return
+        return False
     r = requests.post(
         "https://api.line.me/v2/bot/message/push",
         headers={"Authorization": f"Bearer {token}"},
@@ -116,13 +149,14 @@ def send_line(msg: str) -> None:
         timeout=10,
     )
     r.raise_for_status()
+    return True
 
 
-def send_twilio(msg: str) -> None:
+def send_twilio(msg: str) -> bool:
     sid, tok = os.getenv("TWILIO_SID"), os.getenv("TWILIO_TOKEN")
     frm, to = os.getenv("TWILIO_FROM"), os.getenv("TWILIO_TO")
     if not all([sid, tok, frm, to]):
-        return
+        return False
     from twilio.rest import Client
 
     client = Client(sid, tok)
@@ -133,17 +167,24 @@ def send_twilio(msg: str) -> None:
             from_=frm,
             to=to,
         )
+    return True
 
 
 NOTIFIERS = [send_telegram, send_line, send_twilio]
 
 
-def notify(msg: str) -> None:
+def notify(msg: str) -> int:
+    """Send to every configured channel; return how many actually delivered."""
+    sent = 0
     for fn in NOTIFIERS:
         try:
-            fn(msg)
+            if fn(msg):
+                sent += 1
         except Exception as e:
             print(f"{fn.__name__} failed: {e}")
+    if not sent:
+        print("WARNING: no notification was delivered (no channel configured, or all failed)")
+    return sent
 
 
 # ---------------------------------------------------------------- STATE ---
@@ -159,9 +200,14 @@ def save_state(state: dict) -> None:
 
 
 def alert_key(a: dict) -> str:
-    # Hashed so the committed state file doesn't reveal your tickers/targets.
-    raw = f"{a['ticker'].upper()}|{a['direction']}|{float(a['target'])}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    # With ALERT_KEY_SECRET set, keys are an HMAC, so the committed state file
+    # can't be brute-forced back to your tickers/targets. Without it this is a
+    # plain hash, which is fine locally but reversible in a public repo.
+    raw = f"{a['ticker'].upper()}|{a['direction']}|{float(a['target'])}".encode()
+    secret = os.getenv("ALERT_KEY_SECRET")
+    if secret:
+        return hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()[:16]
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
 # ----------------------------------------------------------------- MAIN ---
@@ -171,18 +217,27 @@ def check_once(alerts: list) -> None:
         key = alert_key(a)
         if state.get(key):          # already fired - don't spam
             continue
-        price = get_price(a["ticker"])
-        if price is None:
+        quote = get_quote(a["ticker"])
+        if quote is None:
             continue
-        hit = price >= a["target"] if a["direction"] == "above" else price <= a["target"]
-        stamp = datetime.now().strftime("%H:%M:%S")
-        print(f"{stamp} {a['ticker']}: {price:.2f} (target {a['direction']} {a['target']})")
+        price, high, low = quote
+        if a["direction"] == "above":
+            extreme, hit = high, high >= a["target"]
+        else:
+            extreme, hit = low, low <= a["target"]
+        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        print(f"{stamp} {a['ticker']}: {price:.2f} (day {low:.2f}-{high:.2f}, "
+              f"target {a['direction']} {a['target']})")
         if hit:
-            msg = (f"Price alert: {a['ticker']} is {price:.2f}, "
-                   f"{a['direction']} your target of {a['target']}.")
-            notify(msg)
-            state[key] = datetime.now().isoformat()
-            save_state(state)
+            msg = f"Price alert: {a['ticker']} is {price:.2f}"
+            if extreme != price:
+                word = "high" if a["direction"] == "above" else "low"
+                msg += f" (day {word} {extreme:.2f})"
+            msg += f", {a['direction']} your target of {a['target']}."
+            if notify(msg):
+                state[key] = datetime.now(timezone.utc).isoformat()
+                save_state(state)
+            # else: leave it armed so the next run tries again
 
 
 def describe(alerts: list) -> str:
@@ -195,10 +250,12 @@ def main() -> None:
         print(error)
     if "--test" in sys.argv:
         if error:
-            notify(f"Test from price_alert.py - notifications work, BUT:\n{error}")
+            sent = notify(f"Test from price_alert.py - notifications work, BUT:\n{error}")
         else:
-            notify("Test from price_alert.py - notifications are working.\n"
-                   f"Watching {len(alerts)} alert(s):\n{describe(alerts)}")
+            sent = notify("Test from price_alert.py - notifications are working.\n"
+                          f"Watching {len(alerts)} alert(s):\n{describe(alerts)}")
+        if not sent:
+            sys.exit(1)
         return
     if error:
         sys.exit(1)
