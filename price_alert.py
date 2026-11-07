@@ -9,6 +9,8 @@ WHERE ALERTS COME FROM (first one that is set wins)
   1. Google Sheet (recommended) - see sheet/Code.gs for the Apps Script.
        SHEET_URL=<web app URL>   SHEET_TOKEN=<token logged by setup()>
      Fired alerts are recorded in the sheet itself; clear "Fired at" to re-arm.
+     The sheet also gets each ticker's 52-week high/low and the mean analyst
+     12-month price target (refreshed about once a day per row).
   2. ALERTS_JSON - a JSON list, e.g.
        [{"ticker": "AAPL", "target": 250, "direction": "above"}]
      Fired alerts are recorded in alert_state.json.
@@ -69,6 +71,8 @@ DEFAULT_ALERTS = [
     {"ticker": "NVDA", "target": 150.0, "direction": "below"},
 ]
 CHECK_SECONDS = 300                      # 5 minutes
+REF_MAX_AGE_HOURS = 20                   # refresh analyst target about once a day
+REF_PER_RUN = 20                         # max analyst lookups per run (rest wait for next run)
 STATE_FILE = Path(__file__).with_name("alert_state.json")
 # ---------------------------------------------------------------------------
 
@@ -166,11 +170,12 @@ def _num(info, *keys) -> float | None:
     return None
 
 
-def get_quote(ticker: str) -> tuple[float, float, float] | None:
-    """(last, day_high, day_low) from Yahoo Finance (may be delayed ~15 min).
+def get_quote(ticker: str) -> tuple | None:
+    """(last, day_high, day_low, year_high, year_low) from Yahoo Finance.
 
-    The day's high/low lets us catch a target that was crossed between checks,
-    even if the price has since moved back.
+    Prices may be delayed ~15 min. The day's high/low lets us catch a target
+    that was crossed between checks, even if the price has since moved back.
+    The 52-week values come from the same lookup (None if unavailable).
     """
     try:
         info = yf.Ticker(ticker).fast_info
@@ -179,10 +184,44 @@ def get_quote(ticker: str) -> tuple[float, float, float] | None:
             return None
         high = _num(info, "dayHigh", "day_high") or last
         low = _num(info, "dayLow", "day_low") or last
-        return last, max(high, last), min(low, last)
+        y_high = _num(info, "yearHigh", "year_high")
+        y_low = _num(info, "yearLow", "year_low")
+        return last, max(high, last), min(low, last), y_high, y_low
     except Exception as e:
         print(f"[{ticker}] price fetch failed: {e}")
         return None
+
+
+def get_analyst_target(ticker: str) -> tuple[float | None, bool]:
+    """(mean analyst 12-month target, ok). ok=False means the lookup failed and
+    should be retried; (None, True) means Yahoo has no analyst coverage."""
+    t = yf.Ticker(ticker)
+    try:
+        targets = t.analyst_price_targets or {}
+        v = _num(targets, "mean")
+        if v is not None:
+            return v, True
+    except Exception as e:
+        print(f"[{ticker}] analyst_price_targets failed: {e}")
+    try:
+        return _num(t.info or {}, "targetMeanPrice"), True
+    except Exception as e:
+        print(f"[{ticker}] analyst target fetch failed: {e}")
+        return None, False
+
+
+def ref_due(a: dict) -> bool:
+    """True if this row's analyst target is missing or older than REF_MAX_AGE_HOURS."""
+    raw = a.get("ref_as_of")
+    if not raw:
+        return True
+    try:
+        when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - when).total_seconds() > REF_MAX_AGE_HOURS * 3600
 
 
 # ------------------------------------------------------------- NOTIFIERS ---
@@ -278,12 +317,39 @@ def check_once(alerts: list) -> None:
     sheet = sheet_enabled()
     state = {} if sheet else load_state()
     updates = []                                   # sheet mode: written back at the end
+    analyst_cache = {}                             # ticker -> (target, ok), once per run
+    budget = [REF_PER_RUN]
 
-    def report(a, status, last=None, fired=None):
+    def report(a, status, last=None, fired=None, extra=None):
         if sheet and "row" in a:
-            updates.append({"row": a["row"], "ticker": a["ticker"],
-                            "direction": a.get("direction"), "target": a.get("target"),
-                            "status": status, "last": last, "fired": fired})
+            u = {"row": a["row"], "ticker": a["ticker"],
+                 "direction": a.get("direction"), "target": a.get("target"),
+                 "status": status, "last": last, "fired": fired}
+            u.update(extra or {})
+            updates.append(u)
+
+    def reference(a, quote) -> dict:
+        """52-week high/low and (when due) the analyst target, for the sheet.
+        Never raises: this data must not get in the way of alerts."""
+        extra = {}
+        if not sheet:
+            return extra
+        if quote and quote[3] is not None and quote[4] is not None:
+            extra["high52"], extra["low52"] = quote[3], quote[4]
+        if quote and ref_due(a):
+            t = a["ticker"]
+            if t not in analyst_cache and budget[0] > 0:
+                budget[0] -= 1
+                try:
+                    analyst_cache[t] = get_analyst_target(t)
+                except Exception as e:
+                    print(f"[{t}] analyst target failed: {e}")
+                    analyst_cache[t] = (None, False)
+            value, ok = analyst_cache.get(t, (None, False))
+            if ok:
+                extra["analyst"] = value           # None = no coverage, blanks the cell
+                a["ref_as_of"] = datetime.now(timezone.utc).isoformat()
+        return extra
 
     for a in alerts:
         if a.get("error"):
@@ -292,12 +358,16 @@ def check_once(alerts: list) -> None:
             continue
         key = alert_key(a)
         if a.get("fired") or state.get(key):     # already fired - don't spam
+            if sheet and ref_due(a):               # but keep its reference data fresh
+                extra = reference(a, get_quote(a["ticker"]))
+                if extra:
+                    report(a, None, extra=extra)  # status None = leave it alone
             continue
         quote = get_quote(a["ticker"])
         if quote is None:
             report(a, "No price - check the ticker (Yahoo format, e.g. CBA.AX)")
             continue
-        price, high, low = quote
+        price, high, low = quote[:3]
         if a["direction"] == "above":
             extreme, hit = high, high >= a["target"]
         else:
@@ -306,7 +376,7 @@ def check_once(alerts: list) -> None:
         print(f"{stamp} {a['ticker']}: {price:.2f} (day {low:.2f}-{high:.2f}, "
               f"target {a['direction']} {a['target']})")
         if not hit:
-            report(a, "Watching", last=price)
+            report(a, "Watching", last=price, extra=reference(a, quote))
             continue
         msg = f"Price alert: {a['ticker']} is {price:.2f}"
         if extreme != price:
@@ -316,13 +386,14 @@ def check_once(alerts: list) -> None:
         if notify(msg):
             now = datetime.now(timezone.utc).isoformat()
             if sheet:
-                report(a, "Fired", last=price, fired=now)
+                report(a, "Fired", last=price, fired=now, extra=reference(a, quote))
             else:
                 state[key] = now
                 save_state(state)
         else:
             # leave it armed so the next run tries again
-            report(a, "Hit, but notification failed - retrying", last=price)
+            report(a, "Hit, but notification failed - retrying", last=price,
+                   extra=reference(a, quote))
 
     if sheet and updates:
         push_sheet_updates(updates)
